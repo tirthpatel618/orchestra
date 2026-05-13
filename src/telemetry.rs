@@ -26,6 +26,9 @@ pub struct RunTrace {
     pub duration_ms: u128,
     pub event_count: u64,
     pub streamed_chunk_count: u64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
     pub nodes: HashMap<NodeId, NodeTrace>,
     pub error: Option<String>,
 }
@@ -40,8 +43,18 @@ pub struct NodeTrace {
     pub duration_ms: u128,
     pub event_count: u64,
     pub streamed_chunk_count: u64,
+    pub llm_usage: Option<LlmUsage>,
     pub output: Option<String>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LlmUsage {
+    pub provider: String,
+    pub model: String,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
 }
 
 impl RunTrace {

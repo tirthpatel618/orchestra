@@ -1,6 +1,6 @@
 use crate::{
-    telemetry::now_ms, Flow, NodeId, NodeStatus, NodeTrace, OrchestraError, RunStatus, RunTrace,
-    RuntimeEvent, TaskInput,
+    telemetry::now_ms, Flow, LlmUsage, NodeId, NodeStatus, NodeTrace, OrchestraError, RunStatus,
+    RunTrace, RuntimeEvent, TaskInput,
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -212,6 +212,7 @@ async fn run_flow(
                     started_at,
                     event_count: 1,
                     streamed_chunk_count: 0,
+                    llm_usage: None,
                 },
             );
 
@@ -465,6 +466,12 @@ async fn handle_task_event(
             if matches!(event, RuntimeEvent::NodeOutput { .. }) {
                 running_node.streamed_chunk_count += 1;
             }
+            if let RuntimeEvent::NodeLlmUsage { usage, .. } = &event {
+                running_node.llm_usage = Some(merge_llm_usage(
+                    running_node.llm_usage.take(),
+                    usage.clone(),
+                ));
+            }
         }
     }
 
@@ -475,6 +482,7 @@ fn event_node(event: &RuntimeEvent) -> Option<&NodeId> {
     match event {
         RuntimeEvent::NodeStarted { node }
         | RuntimeEvent::NodeOutput { node, .. }
+        | RuntimeEvent::NodeLlmUsage { node, .. }
         | RuntimeEvent::NodeCompleted { node, .. }
         | RuntimeEvent::NodeFailed { node, .. }
         | RuntimeEvent::NodeCancelled { node, .. } => Some(node),
@@ -495,6 +503,7 @@ fn completed_node_trace(mut running_node: RunningNode, output: String) -> NodeTr
         duration_ms: running_node.started_at.elapsed().as_millis(),
         event_count: running_node.event_count,
         streamed_chunk_count: running_node.streamed_chunk_count,
+        llm_usage: running_node.llm_usage,
         output: Some(output),
         error: None,
     }
@@ -511,6 +520,7 @@ fn failed_node_trace(mut running_node: RunningNode, error: String) -> NodeTrace 
         duration_ms: running_node.started_at.elapsed().as_millis(),
         event_count: running_node.event_count,
         streamed_chunk_count: running_node.streamed_chunk_count,
+        llm_usage: running_node.llm_usage,
         output: None,
         error: Some(error),
     }
@@ -527,6 +537,7 @@ fn cancelled_node_trace(mut running_node: RunningNode, reason: String) -> NodeTr
         duration_ms: running_node.started_at.elapsed().as_millis(),
         event_count: running_node.event_count,
         streamed_chunk_count: running_node.streamed_chunk_count,
+        llm_usage: running_node.llm_usage,
         output: None,
         error: Some(reason),
     }
@@ -546,6 +557,21 @@ fn build_run_result(
         .values()
         .map(|node| node.streamed_chunk_count)
         .sum::<u64>();
+    let prompt_tokens = nodes
+        .values()
+        .filter_map(|node| node.llm_usage.as_ref())
+        .map(|usage| usage.prompt_tokens)
+        .sum::<u64>();
+    let completion_tokens = nodes
+        .values()
+        .filter_map(|node| node.llm_usage.as_ref())
+        .map(|usage| usage.completion_tokens)
+        .sum::<u64>();
+    let total_tokens = nodes
+        .values()
+        .filter_map(|node| node.llm_usage.as_ref())
+        .map(|usage| usage.total_tokens)
+        .sum::<u64>();
 
     RunResult {
         outputs,
@@ -556,6 +582,9 @@ fn build_run_result(
             duration_ms: started_at.elapsed().as_millis(),
             event_count: run_event_count + node_event_count,
             streamed_chunk_count,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
             nodes,
             error,
         },
@@ -576,6 +605,20 @@ struct RunningNode {
     started_at: Instant,
     event_count: u64,
     streamed_chunk_count: u64,
+    llm_usage: Option<LlmUsage>,
+}
+
+fn merge_llm_usage(existing: Option<LlmUsage>, next: LlmUsage) -> LlmUsage {
+    match existing {
+        Some(existing) => LlmUsage {
+            provider: existing.provider,
+            model: existing.model,
+            prompt_tokens: existing.prompt_tokens + next.prompt_tokens,
+            completion_tokens: existing.completion_tokens + next.completion_tokens,
+            total_tokens: existing.total_tokens + next.total_tokens,
+        },
+        None => next,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -587,7 +630,7 @@ enum NodeRunResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FakeTask, NodeStatus, RunStatus};
+    use crate::{FakeTask, LlmUsage, NodeStatus, RunStatus, Task, TaskFuture};
     use std::time::{Duration, Instant};
 
     #[tokio::test]
@@ -896,5 +939,50 @@ mod tests {
 
         assert_eq!(value["status"], "Completed");
         assert_eq!(value["nodes"]["a"]["status"], "Completed");
+    }
+
+    #[tokio::test]
+    async fn trace_records_llm_usage_events() {
+        let mut flow = Flow::new();
+        flow.add_node("llm", UsageTask).unwrap();
+
+        let result = Pipeline::new(flow).execute_with_trace().await.unwrap();
+        let usage = result.trace.nodes["llm"].llm_usage.as_ref().unwrap();
+
+        assert_eq!(usage.provider, "groq");
+        assert_eq!(usage.model, "llama-3.1-8b-instant");
+        assert_eq!(result.trace.prompt_tokens, 12);
+        assert_eq!(result.trace.completion_tokens, 2);
+        assert_eq!(result.trace.total_tokens, 14);
+    }
+
+    #[derive(Debug, Clone)]
+    struct UsageTask;
+
+    impl Task for UsageTask {
+        fn execute<'a>(
+            &'a self,
+            input: TaskInput,
+            events: Option<mpsc::Sender<RuntimeEvent>>,
+        ) -> TaskFuture<'a> {
+            Box::pin(async move {
+                if let Some(events) = events {
+                    let _ = events
+                        .send(RuntimeEvent::NodeLlmUsage {
+                            node: input.node,
+                            usage: LlmUsage {
+                                provider: "groq".to_string(),
+                                model: "llama-3.1-8b-instant".to_string(),
+                                prompt_tokens: 12,
+                                completion_tokens: 2,
+                                total_tokens: 14,
+                            },
+                        })
+                        .await;
+                }
+
+                Ok("8".to_string())
+            })
+        }
     }
 }
