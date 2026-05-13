@@ -1,4 +1,6 @@
-use orchestra::{Flow, OrchestraError, Pipeline, RuntimeEvent, Task, TaskFuture, TaskInput};
+use orchestra::{
+    Flow, NodeTrace, OrchestraError, Pipeline, RuntimeEvent, Task, TaskFuture, TaskInput,
+};
 use std::time::Duration;
 use tokio::{sync::mpsc, time::sleep};
 
@@ -38,7 +40,7 @@ async fn main() {
     flow.add_dependency("f", "d").unwrap();
     flow.add_dependency("f", "e").unwrap();
 
-    let mut events = Pipeline::new(flow).run();
+    let mut events = Pipeline::new(flow.clone()).run();
     while let Some(event) = events.recv().await {
         println!("{event:?}");
         if matches!(
@@ -48,6 +50,13 @@ async fn main() {
             break;
         }
     }
+
+    let result = Pipeline::new(flow).execute_with_trace().await.unwrap();
+    println!("\nTelemetry");
+    println!("run_status: {:?}", result.trace.status);
+    println!("run_duration_ms: {}", result.trace.duration_ms);
+    println!("final_output: {}", result.outputs["f"]);
+    print_node_trace_summary(result.trace.nodes.values());
 }
 
 #[derive(Debug, Clone)]
@@ -173,5 +182,25 @@ fn parse_dependency_values(input: &TaskInput) -> Result<Vec<(String, i32)>, Orch
 async fn emit(events: &Option<mpsc::Sender<RuntimeEvent>>, event: RuntimeEvent) {
     if let Some(events) = events {
         let _ = events.send(event).await;
+    }
+}
+
+fn print_node_trace_summary<'a>(nodes: impl Iterator<Item = &'a NodeTrace>) {
+    let mut nodes = nodes.collect::<Vec<_>>();
+    nodes.sort_by(|left, right| {
+        left.started_at_ms
+            .cmp(&right.started_at_ms)
+            .then(left.node.cmp(&right.node))
+    });
+
+    for node in nodes {
+        println!(
+            "{:<8} status={:?} duration_ms={:<4} deps={:?} output={}",
+            node.node,
+            node.status,
+            node.duration_ms,
+            node.dependencies,
+            node.output.as_deref().unwrap_or("")
+        );
     }
 }

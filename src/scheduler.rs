@@ -1,8 +1,18 @@
-use crate::{Flow, NodeId, OrchestraError, RuntimeEvent, TaskInput};
+use crate::{
+    telemetry::now_ms, Flow, NodeId, NodeStatus, NodeTrace, OrchestraError, RunStatus, RunTrace,
+    RuntimeEvent, TaskInput,
+};
 use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
 use tokio::{sync::mpsc, task::JoinSet};
 
 pub type RunOutput = HashMap<NodeId, String>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunResult {
+    pub outputs: RunOutput,
+    pub trace: RunTrace,
+}
 
 #[derive(Debug, Clone)]
 pub struct Pipeline {
@@ -24,7 +34,24 @@ impl Pipeline {
     }
 
     pub async fn execute(&self) -> Result<RunOutput, OrchestraError> {
-        run_flow(self.flow.clone(), None).await
+        let (result, error) = run_flow(self.flow.clone(), None).await;
+        match error {
+            Some(error) => Err(error),
+            None => Ok(result.outputs),
+        }
+    }
+
+    pub async fn execute_with_trace(&self) -> Result<RunResult, OrchestraError> {
+        let (result, error) = run_flow(self.flow.clone(), None).await;
+        match error {
+            Some(error) => Err(error),
+            None => Ok(result),
+        }
+    }
+
+    pub async fn execute_report(&self) -> RunResult {
+        let (result, _) = run_flow(self.flow.clone(), None).await;
+        result
     }
 
     pub fn run(&self) -> mpsc::Receiver<RuntimeEvent> {
@@ -42,7 +69,10 @@ impl Pipeline {
 async fn run_flow(
     flow: Flow,
     events: Option<mpsc::Sender<RuntimeEvent>>,
-) -> Result<RunOutput, OrchestraError> {
+) -> (RunResult, Option<OrchestraError>) {
+    let run_started_at_ms = now_ms();
+    let run_started_at = Instant::now();
+
     if let Err(error) = flow.validate() {
         send_event(
             &events,
@@ -51,7 +81,16 @@ async fn run_flow(
             },
         )
         .await;
-        return Err(error);
+        return (
+            failed_run_result(
+                RunOutput::new(),
+                HashMap::new(),
+                run_started_at_ms,
+                run_started_at,
+                error.to_string(),
+            ),
+            Some(error),
+        );
     }
 
     send_event(&events, RuntimeEvent::RunStarted).await;
@@ -74,15 +113,32 @@ async fn run_flow(
         .filter_map(|(id, count)| (*count == 0).then_some(id.clone()))
         .collect::<VecDeque<_>>();
     let mut outputs = RunOutput::new();
+    let mut node_traces = HashMap::new();
     let mut running = JoinSet::new();
 
     loop {
         while let Some(node_id) = ready.pop_front() {
-            let node = flow
-                .nodes()
-                .get(&node_id)
-                .ok_or_else(|| OrchestraError::MissingNode(node_id.clone()))?
-                .clone();
+            let Some(node) = flow.nodes().get(&node_id).cloned() else {
+                let error = OrchestraError::MissingNode(node_id);
+                send_event(
+                    &events,
+                    RuntimeEvent::RunFailed {
+                        error: error.to_string(),
+                    },
+                )
+                .await;
+                return (
+                    failed_run_result(
+                        outputs,
+                        node_traces,
+                        run_started_at_ms,
+                        run_started_at,
+                        error.to_string(),
+                    ),
+                    Some(error),
+                );
+            };
+            let node_dependencies = node.dependencies.clone();
             let dependency_outputs = node
                 .dependencies
                 .iter()
@@ -95,6 +151,8 @@ async fn run_flow(
             let task_events = events.clone();
 
             running.spawn(async move {
+                let started_at_ms = now_ms();
+                let started_at = Instant::now();
                 send_event_to_sender(
                     &task_events,
                     RuntimeEvent::NodeStarted {
@@ -108,9 +166,21 @@ async fn run_flow(
                     dependency_outputs,
                 };
                 let result = node.task.execute(input, task_events.clone()).await;
+                let completed_at_ms = now_ms();
+                let duration_ms = started_at.elapsed().as_millis();
 
                 match result {
                     Ok(output) => {
+                        let trace = NodeTrace {
+                            node: node_id.clone(),
+                            dependencies: node_dependencies,
+                            status: NodeStatus::Completed,
+                            started_at_ms,
+                            completed_at_ms,
+                            duration_ms,
+                            output: Some(output.clone()),
+                            error: None,
+                        };
                         send_event_to_sender(
                             &task_events,
                             RuntimeEvent::NodeCompleted {
@@ -122,9 +192,20 @@ async fn run_flow(
                         NodeRunResult::Completed {
                             node: node_id,
                             output,
+                            trace,
                         }
                     }
                     Err(error) => {
+                        let trace = NodeTrace {
+                            node: node_id.clone(),
+                            dependencies: node_dependencies,
+                            status: NodeStatus::Failed,
+                            started_at_ms,
+                            completed_at_ms,
+                            duration_ms,
+                            output: None,
+                            error: Some(error.to_string()),
+                        };
                         send_event_to_sender(
                             &task_events,
                             RuntimeEvent::NodeFailed {
@@ -136,6 +217,7 @@ async fn run_flow(
                         NodeRunResult::Failed {
                             node: node_id,
                             error,
+                            trace,
                         }
                     }
                 }
@@ -143,6 +225,14 @@ async fn run_flow(
         }
 
         if outputs.len() == flow.nodes().len() {
+            let trace = RunTrace {
+                status: RunStatus::Completed,
+                started_at_ms: run_started_at_ms,
+                completed_at_ms: now_ms(),
+                duration_ms: run_started_at.elapsed().as_millis(),
+                nodes: node_traces,
+                error: None,
+            };
             send_event(
                 &events,
                 RuntimeEvent::RunCompleted {
@@ -150,7 +240,7 @@ async fn run_flow(
                 },
             )
             .await;
-            return Ok(outputs);
+            return (RunResult { outputs, trace }, None);
         }
 
         let Some(joined) = running.join_next().await else {
@@ -162,14 +252,49 @@ async fn run_flow(
                 },
             )
             .await;
-            return Err(error);
+            return (
+                failed_run_result(
+                    outputs,
+                    node_traces,
+                    run_started_at_ms,
+                    run_started_at,
+                    error.to_string(),
+                ),
+                Some(error),
+            );
         };
 
-        let node_result =
-            joined.map_err(|error| OrchestraError::SchedulerJoin(error.to_string()))?;
+        let node_result = match joined {
+            Ok(node_result) => node_result,
+            Err(error) => {
+                let error = OrchestraError::SchedulerJoin(error.to_string());
+                send_event(
+                    &events,
+                    RuntimeEvent::RunFailed {
+                        error: error.to_string(),
+                    },
+                )
+                .await;
+                return (
+                    failed_run_result(
+                        outputs,
+                        node_traces,
+                        run_started_at_ms,
+                        run_started_at,
+                        error.to_string(),
+                    ),
+                    Some(error),
+                );
+            }
+        };
 
         match node_result {
-            NodeRunResult::Completed { node, output } => {
+            NodeRunResult::Completed {
+                node,
+                output,
+                trace,
+            } => {
+                node_traces.insert(node.clone(), trace);
                 outputs.insert(node.clone(), output);
 
                 if let Some(children) = dependents.get(&node) {
@@ -183,7 +308,8 @@ async fn run_flow(
                     }
                 }
             }
-            NodeRunResult::Failed { error, .. } => {
+            NodeRunResult::Failed { node, error, trace } => {
+                node_traces.insert(node, trace);
                 send_event(
                     &events,
                     RuntimeEvent::RunFailed {
@@ -191,9 +317,38 @@ async fn run_flow(
                     },
                 )
                 .await;
-                return Err(error);
+                return (
+                    failed_run_result(
+                        outputs,
+                        node_traces,
+                        run_started_at_ms,
+                        run_started_at,
+                        error.to_string(),
+                    ),
+                    Some(error),
+                );
             }
         }
+    }
+}
+
+fn failed_run_result(
+    outputs: RunOutput,
+    nodes: HashMap<NodeId, NodeTrace>,
+    started_at_ms: u128,
+    started_at: Instant,
+    error: String,
+) -> RunResult {
+    RunResult {
+        outputs,
+        trace: RunTrace {
+            status: RunStatus::Failed,
+            started_at_ms,
+            completed_at_ms: now_ms(),
+            duration_ms: started_at.elapsed().as_millis(),
+            nodes,
+            error: Some(error),
+        },
     }
 }
 
@@ -209,14 +364,22 @@ async fn send_event_to_sender(events: &Option<mpsc::Sender<RuntimeEvent>>, event
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum NodeRunResult {
-    Completed { node: NodeId, output: String },
-    Failed { node: NodeId, error: OrchestraError },
+    Completed {
+        node: NodeId,
+        output: String,
+        trace: NodeTrace,
+    },
+    Failed {
+        node: NodeId,
+        error: OrchestraError,
+        trace: NodeTrace,
+    },
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FakeTask;
+    use crate::{FakeTask, NodeStatus, RunStatus};
     use std::time::{Duration, Instant};
 
     #[tokio::test]
@@ -366,5 +529,49 @@ mod tests {
         let error = Pipeline::new(flow).execute().await.unwrap_err();
 
         assert_eq!(error, OrchestraError::CycleDetected);
+    }
+
+    #[tokio::test]
+    async fn execute_with_trace_records_completed_nodes() {
+        let mut flow = Flow::new();
+        flow.add_node("a", FakeTask::new("alpha")).unwrap();
+        flow.add_node("b", FakeTask::new("beta").include_dependency_outputs())
+            .unwrap();
+        flow.add_dependency("b", "a").unwrap();
+
+        let result = Pipeline::new(flow).execute_with_trace().await.unwrap();
+
+        assert_eq!(result.trace.status, RunStatus::Completed);
+        assert_eq!(result.trace.error, None);
+        assert_eq!(result.outputs["b"], "beta [a=alpha]");
+
+        let b_trace = &result.trace.nodes["b"];
+        assert_eq!(b_trace.node, "b");
+        assert_eq!(b_trace.dependencies, vec!["a".to_string()]);
+        assert_eq!(b_trace.status, NodeStatus::Completed);
+        assert_eq!(b_trace.output, Some("beta [a=alpha]".to_string()));
+        assert_eq!(b_trace.error, None);
+        assert!(b_trace.completed_at_ms >= b_trace.started_at_ms);
+    }
+
+    #[tokio::test]
+    async fn execute_report_records_failed_nodes() {
+        let mut flow = Flow::new();
+        flow.add_node("a", FakeTask::new("a").fail_with("boom"))
+            .unwrap();
+        flow.add_node("b", FakeTask::new("b")).unwrap();
+        flow.add_dependency("b", "a").unwrap();
+
+        let result = Pipeline::new(flow).execute_report().await;
+
+        assert_eq!(result.trace.status, RunStatus::Failed);
+        assert!(result.trace.error.as_deref().unwrap().contains("boom"));
+        assert!(result.outputs.is_empty());
+
+        let a_trace = &result.trace.nodes["a"];
+        assert_eq!(a_trace.status, NodeStatus::Failed);
+        assert_eq!(a_trace.output, None);
+        assert!(a_trace.error.as_deref().unwrap().contains("boom"));
+        assert!(!result.trace.nodes.contains_key("b"));
     }
 }

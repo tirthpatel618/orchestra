@@ -1,4 +1,4 @@
-use orchestra::{FakeTask, Flow, Pipeline, RuntimeEvent};
+use orchestra::{FakeTask, Flow, NodeTrace, Pipeline, RuntimeEvent};
 use std::time::{Duration, Instant};
 
 /*
@@ -106,7 +106,7 @@ async fn main() {
     flow.add_dependency("launch_packet", "launch_page").unwrap();
 
     let started = Instant::now();
-    let mut events = Pipeline::new(flow).run();
+    let mut events = Pipeline::new(flow.clone()).run();
 
     while let Some(event) = events.recv().await {
         println!("{:>4}ms  {event:?}", started.elapsed().as_millis());
@@ -116,5 +116,28 @@ async fn main() {
         ) {
             break;
         }
+    }
+
+    let result = Pipeline::new(flow).execute_with_trace().await.unwrap();
+    println!("\nTelemetry");
+    println!("run_status: {:?}", result.trace.status);
+    println!("run_duration_ms: {}", result.trace.duration_ms);
+    println!("final_output_node: launch_packet");
+    print_node_trace_summary(result.trace.nodes.values());
+}
+
+fn print_node_trace_summary<'a>(nodes: impl Iterator<Item = &'a NodeTrace>) {
+    let mut nodes = nodes.collect::<Vec<_>>();
+    nodes.sort_by(|left, right| {
+        left.started_at_ms
+            .cmp(&right.started_at_ms)
+            .then(left.node.cmp(&right.node))
+    });
+
+    for node in nodes {
+        println!(
+            "{:<14} status={:?} duration_ms={:<4} deps={:?}",
+            node.node, node.status, node.duration_ms, node.dependencies
+        );
     }
 }
