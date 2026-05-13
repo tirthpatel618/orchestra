@@ -26,4 +26,5 @@ async fn main() {
 
     println!("outputs: {:#?}", result.outputs);
     println!("trace: {:#?}", result.trace);
+    println!("trace_json: {}", result.trace_json_pretty().unwrap());
 }

@@ -8,6 +8,7 @@ pub enum RuntimeEvent {
     NodeOutput { node: NodeId, chunk: String },
     NodeCompleted { node: NodeId, output: String },
     NodeFailed { node: NodeId, error: String },
+    NodeCancelled { node: NodeId, reason: String },
     RunCompleted { outputs: RunOutput },
     RunFailed { error: String },
 }

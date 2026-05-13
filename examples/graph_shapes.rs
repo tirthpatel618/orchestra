@@ -16,33 +16,44 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     };
 
-    let flow = match kind {
-        "chain" => synthetic_graphs::chain(
-            parse_required_arg(&args, 2, "length")?,
-            parse_delay(&args, 3),
-        )?,
-        "wide" => synthetic_graphs::wide(
-            parse_required_arg(&args, 2, "width")?,
-            parse_delay(&args, 3),
-        )?,
-        "fan-in" => synthetic_graphs::fan_in(
-            parse_required_arg(&args, 2, "width")?,
-            parse_delay(&args, 3),
-        )?,
+    let (flow, max_concurrency) = match kind {
+        "chain" => (
+            synthetic_graphs::chain(
+                parse_required_arg(&args, 2, "length")?,
+                parse_delay(&args, 3),
+            )?,
+            parse_optional_arg(&args, 4),
+        ),
+        "wide" => (
+            synthetic_graphs::wide(
+                parse_required_arg(&args, 2, "width")?,
+                parse_delay(&args, 3),
+            )?,
+            parse_optional_arg(&args, 4),
+        ),
+        "fan-in" => (
+            synthetic_graphs::fan_in(
+                parse_required_arg(&args, 2, "width")?,
+                parse_delay(&args, 3),
+            )?,
+            parse_optional_arg(&args, 4),
+        ),
         "layered" => synthetic_graphs::layered(
             LayeredSpec {
                 width: parse_required_arg(&args, 2, "width")?,
                 depth: parse_required_arg(&args, 3, "depth")?,
             },
             parse_delay(&args, 4),
-        )?,
+        )
+        .map(|flow| (flow, parse_optional_arg(&args, 5)))?,
         "tree" => synthetic_graphs::tree(
             TreeSpec {
                 depth: parse_required_arg(&args, 2, "depth")?,
                 branching: parse_required_arg(&args, 3, "branching")?,
             },
             parse_delay(&args, 4),
-        )?,
+        )
+        .map(|flow| (flow, parse_optional_arg(&args, 5)))?,
         _ => {
             print_usage(&args[0]);
             return Ok(());
@@ -56,11 +67,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .map(|node| node.dependencies.len())
         .sum::<usize>();
 
+    let mut pipeline = Pipeline::new(flow);
+    if let Some(max_concurrency) = max_concurrency {
+        pipeline = pipeline.with_max_concurrency(max_concurrency);
+    }
+
     let started = Instant::now();
-    let result = Pipeline::new(flow).execute_with_trace().await?;
+    let result = pipeline.execute_with_trace().await?;
     let wall_duration_ms = started.elapsed().as_millis();
 
-    print_summary(kind, node_count, edge_count, wall_duration_ms, result);
+    print_summary(
+        kind,
+        node_count,
+        edge_count,
+        max_concurrency,
+        wall_duration_ms,
+        result,
+    );
     Ok(())
 }
 
@@ -68,6 +91,7 @@ fn print_summary(
     kind: &str,
     node_count: usize,
     edge_count: usize,
+    max_concurrency: Option<usize>,
     wall_duration_ms: u128,
     result: RunResult,
 ) {
@@ -82,11 +106,22 @@ fn print_summary(
     println!("graph: {kind}");
     println!("nodes: {node_count}");
     println!("edges: {edge_count}");
+    println!(
+        "max_concurrency: {}",
+        max_concurrency
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unlimited".to_string())
+    );
     println!("outputs: {}", result.outputs.len());
     println!("run_status: {:?}", result.trace.status);
     println!("trace_duration_ms: {}", result.trace.duration_ms);
     println!("wall_duration_ms: {wall_duration_ms}");
     println!("max_node_duration_ms: {max_node_duration}");
+    println!("event_count: {}", result.trace.event_count);
+    println!(
+        "streamed_chunk_count: {}",
+        result.trace.streamed_chunk_count
+    );
 }
 
 fn parse_required_arg(args: &[String], index: usize, name: &str) -> Result<usize, GraphSpecError> {
@@ -104,11 +139,16 @@ fn parse_delay(args: &[String], index: usize) -> Duration {
     Duration::from_millis(delay_ms)
 }
 
+fn parse_optional_arg(args: &[String], index: usize) -> Option<usize> {
+    args.get(index)
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
 fn print_usage(binary: &str) {
     println!("usage:");
-    println!("  {binary} chain <length> [delay_ms]");
-    println!("  {binary} wide <width> [delay_ms]");
-    println!("  {binary} fan-in <width> [delay_ms]");
-    println!("  {binary} layered <width> <depth> [delay_ms]");
-    println!("  {binary} tree <depth> <branching> [delay_ms]");
+    println!("  {binary} chain <length> [delay_ms] [max_concurrency]");
+    println!("  {binary} wide <width> [delay_ms] [max_concurrency]");
+    println!("  {binary} fan-in <width> [delay_ms] [max_concurrency]");
+    println!("  {binary} layered <width> <depth> [delay_ms] [max_concurrency]");
+    println!("  {binary} tree <depth> <branching> [delay_ms] [max_concurrency]");
 }

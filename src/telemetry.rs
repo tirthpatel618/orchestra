@@ -15,6 +15,7 @@ pub enum RunStatus {
 pub enum NodeStatus {
     Completed,
     Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +24,8 @@ pub struct RunTrace {
     pub started_at_ms: u128,
     pub completed_at_ms: u128,
     pub duration_ms: u128,
+    pub event_count: u64,
+    pub streamed_chunk_count: u64,
     pub nodes: HashMap<NodeId, NodeTrace>,
     pub error: Option<String>,
 }
@@ -35,8 +38,20 @@ pub struct NodeTrace {
     pub started_at_ms: u128,
     pub completed_at_ms: u128,
     pub duration_ms: u128,
+    pub event_count: u64,
+    pub streamed_chunk_count: u64,
     pub output: Option<String>,
     pub error: Option<String>,
+}
+
+impl RunTrace {
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+
+    pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
 }
 
 pub(crate) fn now_ms() -> u128 {

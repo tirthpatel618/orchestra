@@ -7,7 +7,8 @@ use std::time::Duration;
     source_bad ──────> blocked
           x fails
 
-    independent still completes before the run fails if it is already running.
+    independent completes before the run fails.
+    slow_sibling starts, then gets cancelled when source_bad fails.
 */
 
 #[tokio::main]
@@ -59,6 +60,12 @@ fn build_flow() -> Flow {
         FakeTask::new("side result")
             .delay(Duration::from_millis(50))
             .chunks(["side branch"]),
+    )
+    .unwrap();
+
+    flow.add_node(
+        "slow_sibling",
+        FakeTask::new("too slow").delay(Duration::from_secs(5)),
     )
     .unwrap();
 
