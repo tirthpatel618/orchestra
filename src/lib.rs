@@ -3,6 +3,7 @@ mod event;
 mod fake;
 mod flow;
 mod llm;
+mod python;
 mod scheduler;
 mod task;
 mod telemetry;

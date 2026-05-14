@@ -1,0 +1,13 @@
+[build-system]
+requires = ["maturin>=1.8,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "orchestra"
+version = "0.1.0"
+description = "Rust DAG scheduler with Python bindings"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+
+[tool.maturin]
+features = ["extension-module"]
