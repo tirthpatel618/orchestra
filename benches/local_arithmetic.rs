@@ -23,10 +23,18 @@ fn bench_chain(c: &mut Criterion, runtime: &Runtime) {
         let graph = arithmetic_graphs::chain(length, Duration::ZERO).unwrap();
         verify_graph(&runtime, &graph);
         let pipeline = Pipeline::new(graph.flow.clone());
+        let compiled = pipeline.compile().unwrap();
         group.throughput(Throughput::Elements(length as u64));
-        group.bench_function(BenchmarkId::from_parameter(length), |bench| {
+        group.bench_function(BenchmarkId::new("pipeline", length), |bench| {
             bench.to_async(runtime).iter(|| async {
                 let result = pipeline.execute_with_trace().await.unwrap();
+                black_box(result.outputs.len());
+                black_box(result.trace.duration_ms);
+            });
+        });
+        group.bench_function(BenchmarkId::new("compiled", length), |bench| {
+            bench.to_async(runtime).iter(|| async {
+                let result = compiled.execute_with_trace().await.unwrap();
                 black_box(result.outputs.len());
                 black_box(result.trace.duration_ms);
             });
@@ -41,10 +49,18 @@ fn bench_wide(c: &mut Criterion, runtime: &Runtime) {
         let graph = arithmetic_graphs::wide(width, Duration::ZERO).unwrap();
         verify_graph(&runtime, &graph);
         let pipeline = Pipeline::new(graph.flow.clone()).with_max_concurrency(1_024);
+        let compiled = pipeline.compile().unwrap();
         group.throughput(Throughput::Elements(width as u64));
-        group.bench_function(BenchmarkId::from_parameter(width), |bench| {
+        group.bench_function(BenchmarkId::new("pipeline", width), |bench| {
             bench.to_async(runtime).iter(|| async {
                 let result = pipeline.execute_with_trace().await.unwrap();
+                black_box(result.outputs.len());
+                black_box(result.trace.duration_ms);
+            });
+        });
+        group.bench_function(BenchmarkId::new("compiled", width), |bench| {
+            bench.to_async(runtime).iter(|| async {
+                let result = compiled.execute_with_trace().await.unwrap();
                 black_box(result.outputs.len());
                 black_box(result.trace.duration_ms);
             });
@@ -59,10 +75,18 @@ fn bench_fan_in(c: &mut Criterion, runtime: &Runtime) {
         let graph = arithmetic_graphs::fan_in(width, Duration::ZERO).unwrap();
         verify_graph(&runtime, &graph);
         let pipeline = Pipeline::new(graph.flow.clone()).with_max_concurrency(1_024);
+        let compiled = pipeline.compile().unwrap();
         group.throughput(Throughput::Elements(width as u64));
-        group.bench_function(BenchmarkId::from_parameter(width), |bench| {
+        group.bench_function(BenchmarkId::new("pipeline", width), |bench| {
             bench.to_async(runtime).iter(|| async {
                 let result = pipeline.execute_with_trace().await.unwrap();
+                black_box(result.outputs.len());
+                black_box(result.trace.duration_ms);
+            });
+        });
+        group.bench_function(BenchmarkId::new("compiled", width), |bench| {
+            bench.to_async(runtime).iter(|| async {
+                let result = compiled.execute_with_trace().await.unwrap();
                 black_box(result.outputs.len());
                 black_box(result.trace.duration_ms);
             });
@@ -78,12 +102,23 @@ fn bench_layered(c: &mut Criterion, runtime: &Runtime) {
             arithmetic_graphs::layered(LayeredSpec { width, depth }, Duration::ZERO).unwrap();
         verify_graph(&runtime, &graph);
         let pipeline = Pipeline::new(graph.flow.clone()).with_max_concurrency(1_024);
+        let compiled = pipeline.compile().unwrap();
         group.throughput(Throughput::Elements((width * depth) as u64));
         group.bench_function(
-            BenchmarkId::new("width_depth", format!("{width}x{depth}")),
+            BenchmarkId::new("pipeline", format!("{width}x{depth}")),
             |bench| {
                 bench.to_async(runtime).iter(|| async {
                     let result = pipeline.execute_with_trace().await.unwrap();
+                    black_box(result.outputs.len());
+                    black_box(result.trace.duration_ms);
+                });
+            },
+        );
+        group.bench_function(
+            BenchmarkId::new("compiled", format!("{width}x{depth}")),
+            |bench| {
+                bench.to_async(runtime).iter(|| async {
+                    let result = compiled.execute_with_trace().await.unwrap();
                     black_box(result.outputs.len());
                     black_box(result.trace.duration_ms);
                 });
@@ -99,12 +134,23 @@ fn bench_tree(c: &mut Criterion, runtime: &Runtime) {
         let graph = arithmetic_graphs::tree(TreeSpec { depth, branching }, Duration::ZERO).unwrap();
         verify_graph(&runtime, &graph);
         let pipeline = Pipeline::new(graph.flow.clone()).with_max_concurrency(1_024);
+        let compiled = pipeline.compile().unwrap();
         group.throughput(Throughput::Elements(graph.flow.nodes().len() as u64));
         group.bench_function(
-            BenchmarkId::new("depth_branching", format!("{depth}x{branching}")),
+            BenchmarkId::new("pipeline", format!("{depth}x{branching}")),
             |bench| {
                 bench.to_async(runtime).iter(|| async {
                     let result = pipeline.execute_with_trace().await.unwrap();
+                    black_box(result.outputs.len());
+                    black_box(result.trace.duration_ms);
+                });
+            },
+        );
+        group.bench_function(
+            BenchmarkId::new("compiled", format!("{depth}x{branching}")),
+            |bench| {
+                bench.to_async(runtime).iter(|| async {
+                    let result = compiled.execute_with_trace().await.unwrap();
                     black_box(result.outputs.len());
                     black_box(result.trace.duration_ms);
                 });

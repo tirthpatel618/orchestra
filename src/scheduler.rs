@@ -1,9 +1,10 @@
 use crate::{
-    telemetry::now_ms, Flow, LlmUsage, NodeId, NodeStatus, NodeTrace, OrchestraError, RunStatus,
-    RunTrace, RuntimeEvent, TaskInput,
+    telemetry::now_ms, Flow, LlmUsage, Node, NodeId, NodeStatus, NodeTrace, OrchestraError,
+    RunStatus, RunTrace, RuntimeEvent, TaskInput,
 };
 use std::{
     collections::{HashMap, VecDeque},
+    sync::Arc,
     time::Instant,
 };
 use tokio::{sync::mpsc, task::JoinSet};
@@ -33,6 +34,13 @@ pub struct Pipeline {
     max_concurrency: Option<usize>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CompiledPipeline {
+    flow: Arc<CompiledFlow>,
+    event_buffer: usize,
+    max_concurrency: Option<usize>,
+}
+
 impl Pipeline {
     pub fn new(flow: Flow) -> Self {
         Self {
@@ -52,8 +60,16 @@ impl Pipeline {
         self
     }
 
+    pub fn compile(&self) -> Result<CompiledPipeline, OrchestraError> {
+        Ok(CompiledPipeline {
+            flow: Arc::new(CompiledFlow::compile(self.flow.clone())?),
+            event_buffer: self.event_buffer,
+            max_concurrency: self.max_concurrency,
+        })
+    }
+
     pub async fn execute(&self) -> Result<RunOutput, OrchestraError> {
-        let (result, error) = run_flow(
+        let (result, error) = run_uncompiled_flow(
             self.flow.clone(),
             None,
             self.event_buffer,
@@ -67,7 +83,7 @@ impl Pipeline {
     }
 
     pub async fn execute_with_trace(&self) -> Result<RunResult, OrchestraError> {
-        let (result, error) = run_flow(
+        let (result, error) = run_uncompiled_flow(
             self.flow.clone(),
             None,
             self.event_buffer,
@@ -81,7 +97,7 @@ impl Pipeline {
     }
 
     pub async fn execute_report(&self) -> RunResult {
-        let (result, _) = run_flow(
+        let (result, _) = run_uncompiled_flow(
             self.flow.clone(),
             None,
             self.event_buffer,
@@ -98,14 +114,122 @@ impl Pipeline {
         let (events, receiver) = mpsc::channel(event_buffer);
 
         tokio::spawn(async move {
-            let _ = run_flow(flow, Some(events), event_buffer, max_concurrency).await;
+            let _ = run_uncompiled_flow(flow, Some(events), event_buffer, max_concurrency).await;
         });
 
         receiver
     }
 }
 
-async fn run_flow(
+impl CompiledPipeline {
+    pub fn with_event_buffer(mut self, event_buffer: usize) -> Self {
+        self.event_buffer = event_buffer.max(1);
+        self
+    }
+
+    pub fn with_max_concurrency(mut self, max_concurrency: usize) -> Self {
+        self.max_concurrency = Some(max_concurrency.max(1));
+        self
+    }
+
+    pub async fn execute(&self) -> Result<RunOutput, OrchestraError> {
+        let (result, error) = run_compiled_flow(
+            self.flow.clone(),
+            None,
+            self.event_buffer,
+            self.max_concurrency,
+        )
+        .await;
+        match error {
+            Some(error) => Err(error),
+            None => Ok(result.outputs),
+        }
+    }
+
+    pub async fn execute_with_trace(&self) -> Result<RunResult, OrchestraError> {
+        let (result, error) = run_compiled_flow(
+            self.flow.clone(),
+            None,
+            self.event_buffer,
+            self.max_concurrency,
+        )
+        .await;
+        match error {
+            Some(error) => Err(error),
+            None => Ok(result),
+        }
+    }
+
+    pub async fn execute_report(&self) -> RunResult {
+        let (result, _) = run_compiled_flow(
+            self.flow.clone(),
+            None,
+            self.event_buffer,
+            self.max_concurrency,
+        )
+        .await;
+        result
+    }
+
+    pub fn run(&self) -> mpsc::Receiver<RuntimeEvent> {
+        let flow = self.flow.clone();
+        let event_buffer = self.event_buffer;
+        let max_concurrency = self.max_concurrency;
+        let (events, receiver) = mpsc::channel(event_buffer);
+
+        tokio::spawn(async move {
+            let _ = run_compiled_flow(flow, Some(events), event_buffer, max_concurrency).await;
+        });
+
+        receiver
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CompiledFlow {
+    nodes: HashMap<NodeId, Node>,
+    remaining_dependencies: HashMap<NodeId, usize>,
+    dependents: HashMap<NodeId, Vec<NodeId>>,
+    roots: Vec<NodeId>,
+}
+
+impl CompiledFlow {
+    fn compile(flow: Flow) -> Result<Self, OrchestraError> {
+        flow.validate()?;
+
+        let mut remaining_dependencies = HashMap::new();
+        let mut dependents: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+
+        for (id, node) in flow.nodes() {
+            remaining_dependencies.insert(id.clone(), node.dependencies.len());
+            for dependency in &node.dependencies {
+                dependents
+                    .entry(dependency.clone())
+                    .or_default()
+                    .push(id.clone());
+            }
+        }
+
+        let mut roots = remaining_dependencies
+            .iter()
+            .filter_map(|(id, count)| (*count == 0).then_some(id.clone()))
+            .collect::<Vec<_>>();
+        roots.sort();
+
+        for children in dependents.values_mut() {
+            children.sort();
+        }
+
+        Ok(Self {
+            nodes: flow.nodes().clone(),
+            remaining_dependencies,
+            dependents,
+            roots,
+        })
+    }
+}
+
+async fn run_uncompiled_flow(
     flow: Flow,
     events: Option<mpsc::Sender<RuntimeEvent>>,
     event_buffer: usize,
@@ -113,49 +237,77 @@ async fn run_flow(
 ) -> (RunResult, Option<OrchestraError>) {
     let run_started_at_ms = now_ms();
     let run_started_at = Instant::now();
-    let max_concurrency = max_concurrency.unwrap_or(usize::MAX).max(1);
 
-    if let Err(error) = flow.validate() {
-        send_event(
-            &events,
-            RuntimeEvent::RunFailed {
-                error: error.to_string(),
-            },
-        )
-        .await;
-        return (
-            build_run_result(
-                RunStatus::Failed,
-                RunOutput::new(),
-                HashMap::new(),
-                run_started_at_ms,
-                run_started_at,
-                Some(error.to_string()),
-                1,
-            ),
-            Some(error),
-        );
-    }
+    let compiled = match CompiledFlow::compile(flow) {
+        Ok(compiled) => Arc::new(compiled),
+        Err(error) => {
+            send_event(
+                &events,
+                RuntimeEvent::RunFailed {
+                    error: error.to_string(),
+                },
+            )
+            .await;
+            return (
+                build_run_result(
+                    RunStatus::Failed,
+                    RunOutput::new(),
+                    HashMap::new(),
+                    run_started_at_ms,
+                    run_started_at,
+                    Some(error.to_string()),
+                    1,
+                ),
+                Some(error),
+            );
+        }
+    };
+
+    run_compiled_flow_with_start(
+        compiled,
+        events,
+        event_buffer,
+        max_concurrency,
+        run_started_at_ms,
+        run_started_at,
+    )
+    .await
+}
+
+async fn run_compiled_flow(
+    flow: Arc<CompiledFlow>,
+    events: Option<mpsc::Sender<RuntimeEvent>>,
+    event_buffer: usize,
+    max_concurrency: Option<usize>,
+) -> (RunResult, Option<OrchestraError>) {
+    let run_started_at_ms = now_ms();
+    let run_started_at = Instant::now();
+
+    run_compiled_flow_with_start(
+        flow,
+        events,
+        event_buffer,
+        max_concurrency,
+        run_started_at_ms,
+        run_started_at,
+    )
+    .await
+}
+
+async fn run_compiled_flow_with_start(
+    flow: Arc<CompiledFlow>,
+    events: Option<mpsc::Sender<RuntimeEvent>>,
+    event_buffer: usize,
+    max_concurrency: Option<usize>,
+    run_started_at_ms: u128,
+    run_started_at: Instant,
+) -> (RunResult, Option<OrchestraError>) {
+    let max_concurrency = max_concurrency.unwrap_or(usize::MAX).max(1);
 
     send_event(&events, RuntimeEvent::RunStarted).await;
 
-    let mut remaining_dependencies = HashMap::new();
-    let mut dependents: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
-
-    for (id, node) in flow.nodes() {
-        remaining_dependencies.insert(id.clone(), node.dependencies.len());
-        for dependency in &node.dependencies {
-            dependents
-                .entry(dependency.clone())
-                .or_default()
-                .push(id.clone());
-        }
-    }
-
-    let mut ready = remaining_dependencies
-        .iter()
-        .filter_map(|(id, count)| (*count == 0).then_some(id.clone()))
-        .collect::<VecDeque<_>>();
+    let mut remaining_dependencies = flow.remaining_dependencies.clone();
+    let mut ready = flow.roots.iter().cloned().collect::<VecDeque<_>>();
     let mut outputs = RunOutput::new();
     let mut node_traces = HashMap::new();
     let mut running_nodes = HashMap::new();
@@ -168,7 +320,7 @@ async fn run_flow(
                 break;
             };
 
-            let Some(node) = flow.nodes().get(&node_id).cloned() else {
+            let Some(node) = flow.nodes.get(&node_id).cloned() else {
                 let error = OrchestraError::MissingNode(node_id);
                 send_event(
                     &events,
@@ -246,7 +398,7 @@ async fn run_flow(
             });
         }
 
-        if outputs.len() == flow.nodes().len() {
+        if outputs.len() == flow.nodes.len() {
             let result = build_run_result(
                 RunStatus::Completed,
                 outputs,
@@ -353,7 +505,7 @@ async fn run_flow(
                         )
                         .await;
 
-                        if let Some(children) = dependents.get(&node) {
+                        if let Some(children) = flow.dependents.get(&node) {
                             for child in children {
                                 if let Some(count) = remaining_dependencies.get_mut(child) {
                                     *count -= 1;
@@ -751,6 +903,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn empty_flow_completes_with_no_outputs() {
+        let flow = Flow::new();
+
+        let result = Pipeline::new(flow).execute_with_trace().await.unwrap();
+
+        assert!(result.outputs.is_empty());
+        assert_eq!(result.trace.status, RunStatus::Completed);
+        assert_eq!(result.trace.event_count, 2);
+        assert!(result.trace.nodes.is_empty());
+    }
+
+    #[tokio::test]
     async fn failed_node_fails_the_run() {
         let mut flow = Flow::new();
         flow.add_node("a", FakeTask::new("a").fail_with("boom"))
@@ -954,6 +1118,65 @@ mod tests {
         assert_eq!(result.trace.prompt_tokens, 12);
         assert_eq!(result.trace.completion_tokens, 2);
         assert_eq!(result.trace.total_tokens, 14);
+    }
+
+    #[tokio::test]
+    async fn compiled_pipeline_matches_pipeline_outputs() {
+        let mut flow = Flow::new();
+        flow.add_node("a", FakeTask::new("alpha")).unwrap();
+        flow.add_node("b", FakeTask::new("beta")).unwrap();
+        flow.add_node("c", FakeTask::new("combine").include_dependency_outputs())
+            .unwrap();
+        flow.add_dependency("c", "a").unwrap();
+        flow.add_dependency("c", "b").unwrap();
+
+        let pipeline = Pipeline::new(flow);
+        let uncompiled = pipeline.execute_with_trace().await.unwrap();
+        let compiled = pipeline
+            .compile()
+            .unwrap()
+            .execute_with_trace()
+            .await
+            .unwrap();
+
+        assert_eq!(compiled.outputs, uncompiled.outputs);
+        assert_eq!(compiled.trace.status, RunStatus::Completed);
+        assert_eq!(compiled.trace.nodes.len(), 3);
+    }
+
+    #[test]
+    fn compiled_pipeline_rejects_invalid_graph_at_compile_time() {
+        let mut flow = Flow::new();
+        flow.add_node("a", FakeTask::new("a")).unwrap();
+        flow.add_node("b", FakeTask::new("b")).unwrap();
+        flow.add_dependency("a", "b").unwrap();
+        flow.add_dependency("b", "a").unwrap();
+
+        let error = Pipeline::new(flow).compile().unwrap_err();
+
+        assert_eq!(error, OrchestraError::CycleDetected);
+    }
+
+    #[tokio::test]
+    async fn compiled_pipeline_streams_events() {
+        let mut flow = Flow::new();
+        flow.add_node("a", FakeTask::new("done").chunks(["working"]))
+            .unwrap();
+
+        let mut events = Pipeline::new(flow).compile().unwrap().run();
+        let mut seen = Vec::new();
+        while let Some(event) = events.recv().await {
+            seen.push(event);
+        }
+
+        assert!(seen.contains(&RuntimeEvent::RunStarted));
+        assert!(seen.contains(&RuntimeEvent::NodeOutput {
+            node: "a".to_string(),
+            chunk: "working".to_string()
+        }));
+        assert!(seen
+            .iter()
+            .any(|event| matches!(event, RuntimeEvent::RunCompleted { .. })));
     }
 
     #[derive(Debug, Clone)]
