@@ -22,7 +22,7 @@ RUNNERS = {
 }
 
 PRESETS: dict[str, list[dict[str, int | str]]] = {
-    "smoke": [
+    "small": [
         {"shape": "chain", "size": 20, "repeats": 3, "warmups": 1},
         {"shape": "wide", "size": 50, "repeats": 3, "warmups": 1},
         {"shape": "fan_in", "size": 50, "repeats": 3, "warmups": 1},
@@ -61,7 +61,33 @@ PRESETS: dict[str, list[dict[str, int | str]]] = {
             "warmups": 2,
         },
     ],
+    "very_large": [
+        {"shape": "chain", "size": 50_000, "repeats": 5, "warmups": 1},
+        {"shape": "wide", "size": 50_000, "repeats": 5, "warmups": 1},
+        {"shape": "fan_in", "size": 50_000, "repeats": 5, "warmups": 1},
+        {
+            "shape": "layered",
+            "width": 200,
+            "depth": 100,
+            "repeats": 3,
+            "warmups": 1,
+        },
+        {
+            "shape": "tree",
+            "depth": 10,
+            "branching": 3,
+            "repeats": 3,
+            "warmups": 1,
+        },
+    ],
 }
+
+PRESETS["full"] = [
+    *PRESETS["small"],
+    *PRESETS["medium"],
+    *PRESETS["large"],
+    *PRESETS["very_large"],
+]
 
 
 def main() -> None:
