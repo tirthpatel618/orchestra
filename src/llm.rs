@@ -99,6 +99,8 @@ pub struct LlmTask {
     system_prompt: String,
     user_prompt: String,
     include_dependency_outputs: bool,
+    normalize_integer_output: bool,
+    substitute_dependency_outputs: bool,
     client: reqwest::Client,
 }
 
@@ -109,12 +111,14 @@ impl LlmTask {
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
             user_prompt: user_prompt.into(),
             include_dependency_outputs: false,
+            normalize_integer_output: false,
+            substitute_dependency_outputs: false,
             client: reqwest::Client::new(),
         }
     }
 
     pub fn arithmetic(config: LlmConfig, expression: impl Into<String>) -> Self {
-        Self::new(config, expression)
+        Self::new(config, expression).normalize_integer_output()
     }
 
     pub fn with_system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
@@ -127,7 +131,25 @@ impl LlmTask {
         self
     }
 
+    pub fn normalize_integer_output(mut self) -> Self {
+        self.normalize_integer_output = true;
+        self
+    }
+
+    pub fn substitute_dependency_outputs(mut self) -> Self {
+        self.substitute_dependency_outputs = true;
+        self
+    }
+
     fn render_user_prompt(&self, input: &TaskInput) -> String {
+        if self.substitute_dependency_outputs {
+            let mut prompt = self.user_prompt.clone();
+            for (node, output) in &input.dependency_outputs {
+                prompt = prompt.replace(&format!("{{{node}}}"), output);
+            }
+            return prompt;
+        }
+
         if !self.include_dependency_outputs {
             return self.user_prompt.clone();
         }
@@ -153,13 +175,18 @@ impl LlmTask {
 
 impl fmt::Debug for LlmTask {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LlmTask")
-            .field("config", &self.config)
-            .field("system_prompt", &self.system_prompt)
-            .field("user_prompt", &self.user_prompt)
-            .field(
+            f.debug_struct("LlmTask")
+                .field("config", &self.config)
+                .field("system_prompt", &self.system_prompt)
+                .field("user_prompt", &self.user_prompt)
+                .field(
                 "include_dependency_outputs",
                 &self.include_dependency_outputs,
+            )
+            .field("normalize_integer_output", &self.normalize_integer_output)
+            .field(
+                "substitute_dependency_outputs",
+                &self.substitute_dependency_outputs,
             )
             .finish_non_exhaustive()
     }
@@ -226,6 +253,16 @@ impl Task for LlmTask {
                 .filter(|content| !content.is_empty())
                 .ok_or_else(|| node_failed(&input.node, "LLM response did not contain content"))?
                 .to_string();
+            let output = if self.normalize_integer_output {
+                last_integer(&output).ok_or_else(|| {
+                    node_failed(
+                        &input.node,
+                        format!("LLM response did not contain an integer: {output}"),
+                    )
+                })?
+            } else {
+                output
+            };
 
             if let Some(usage) = completion.usage {
                 send_usage(
@@ -273,6 +310,27 @@ fn truncate(value: &str, max_chars: usize) -> String {
     } else {
         truncated
     }
+}
+
+fn last_integer(value: &str) -> Option<String> {
+    let mut integers = Vec::new();
+    let mut current = String::new();
+
+    for character in value.chars() {
+        if character.is_ascii_digit() || (character == '-' && current.is_empty()) {
+            current.push(character);
+        } else if current.chars().any(|character| character.is_ascii_digit()) {
+            integers.push(std::mem::take(&mut current));
+        } else {
+            current.clear();
+        }
+    }
+
+    if current.chars().any(|character| character.is_ascii_digit()) {
+        integers.push(current);
+    }
+
+    integers.pop()
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -345,5 +403,27 @@ mod tests {
 
         assert!(prompt.contains("a = 3\nb = 7"));
         assert!(prompt.ends_with("Return only the final answer."));
+    }
+
+    #[test]
+    fn dependency_outputs_can_be_substituted_into_prompt() {
+        let task = LlmTask::arithmetic(LlmConfig::groq("test-key"), "{a} * {b}")
+            .substitute_dependency_outputs();
+        let input = TaskInput {
+            node: "multiply".to_string(),
+            dependency_outputs: HashMap::from([
+                ("a".to_string(), "36".to_string()),
+                ("b".to_string(), "15".to_string()),
+            ]),
+        };
+
+        assert_eq!(task.render_user_prompt(&input), "36 * 15");
+    }
+
+    #[test]
+    fn arithmetic_output_uses_last_integer() {
+        assert_eq!(last_integer("36 * 15 = 540"), Some("540".to_string()));
+        assert_eq!(last_integer("answer: -12"), Some("-12".to_string()));
+        assert_eq!(last_integer("no integer"), None);
     }
 }

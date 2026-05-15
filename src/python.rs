@@ -54,13 +54,14 @@ impl PyFlow {
         self.flow.add_dependency(node, dependency).map_err(map_error)
     }
 
-    #[pyo3(signature = (id, operation, *, operands = None, delay_ms = 0))]
+    #[pyo3(signature = (id, operation, *, operands = None, delay_ms = 0, modulus = None))]
     pub fn add_arithmetic_node(
         &mut self,
         id: String,
         operation: String,
         operands: Option<Vec<i64>>,
         delay_ms: u64,
+        modulus: Option<i64>,
     ) -> PyResult<()> {
         let operation = ArithmeticOperation::parse(&operation)?;
         let operands = operands
@@ -68,6 +69,9 @@ impl PyFlow {
             .into_iter()
             .map(i128::from)
             .collect::<Vec<_>>();
+        let modulus = modulus
+            .map(i128::from)
+            .filter(|value| *value > 0);
 
         if matches!(operation, ArithmeticOperation::Constant) && operands.len() != 1 {
             return Err(PyValueError::new_err(
@@ -82,12 +86,13 @@ impl PyFlow {
                     operation,
                     operands,
                     delay: Duration::from_millis(delay_ms),
+                    modulus,
                 },
             )
             .map_err(map_error)
     }
 
-    #[pyo3(signature = (id, prompt, *, api_key = None, model = None, max_tokens = 8, temperature = 0.0, include_dependency_outputs = false))]
+    #[pyo3(signature = (id, prompt, *, api_key = None, model = None, max_tokens = 8, temperature = 0.0, include_dependency_outputs = false, substitute_dependency_outputs = false))]
     pub fn add_groq_llm_node(
         &mut self,
         id: String,
@@ -97,6 +102,7 @@ impl PyFlow {
         max_tokens: u16,
         temperature: f32,
         include_dependency_outputs: bool,
+        substitute_dependency_outputs: bool,
     ) -> PyResult<()> {
         let mut config = match api_key {
             Some(api_key) => LlmConfig::groq(api_key),
@@ -112,6 +118,9 @@ impl PyFlow {
         let mut task = LlmTask::arithmetic(config, prompt);
         if include_dependency_outputs {
             task = task.include_dependency_outputs();
+        }
+        if substitute_dependency_outputs {
+            task = task.substitute_dependency_outputs();
         }
 
         self.flow.add_node(id, task).map_err(map_error)
@@ -248,6 +257,7 @@ struct LocalArithmeticTask {
     operation: ArithmeticOperation,
     operands: Vec<i128>,
     delay: Duration,
+    modulus: Option<i128>,
 }
 
 impl Task for LocalArithmeticTask {
@@ -267,20 +277,24 @@ impl Task for LocalArithmeticTask {
                 .map(|(node, output)| parse_dependency_output(node, output))
                 .collect::<Result<Vec<_>, _>>()?;
 
+            let values = self
+                .operands
+                .iter()
+                .chain(dependency_values.iter())
+                .copied()
+                .collect::<Vec<_>>();
+
             let value = match self.operation {
-                ArithmeticOperation::Constant => self.operands[0],
-                ArithmeticOperation::Add => self
-                    .operands
-                    .iter()
-                    .chain(dependency_values.iter())
-                    .copied()
-                    .sum(),
-                ArithmeticOperation::Multiply => self
-                    .operands
-                    .iter()
-                    .chain(dependency_values.iter())
-                    .copied()
-                    .product(),
+                ArithmeticOperation::Constant => apply_modulus(self.operands[0], self.modulus),
+                ArithmeticOperation::Add => values.into_iter().fold(0, |sum, value| {
+                    apply_modulus(sum + apply_modulus(value, self.modulus), self.modulus)
+                }),
+                ArithmeticOperation::Multiply => values.into_iter().fold(1, |product, value| {
+                    apply_modulus(
+                        product * apply_modulus(value, self.modulus),
+                        self.modulus,
+                    )
+                }),
             };
 
             Ok(value.to_string())
@@ -316,4 +330,11 @@ fn parse_dependency_output(node: &str, output: &str) -> Result<i128, OrchestraEr
             node: node.to_string(),
             message: format!("dependency output is not an integer: {error}"),
         })
+}
+
+fn apply_modulus(value: i128, modulus: Option<i128>) -> i128 {
+    match modulus {
+        Some(modulus) => value.rem_euclid(modulus),
+        None => value,
+    }
 }
