@@ -1,23 +1,7 @@
 # Orchestra
 
-## Orchestration/runtime layer 
-Python user code defines workflow
-Rust runtime executes workflow, then streams events/traces back
+Orchestra is a Rust-first DAG orchestration runtime for running dependency-aware task graphs. Python code can define a workflow, then Orchestra compiles and executes the graph in Rust while streaming events, traces, and outputs back to the caller.
 
-## What Orchestra Will Own: 
-- DAG validation
-- dependency scheduling
-- task lifecycle
-- concurrency
-- bounded event channels
-- timeout/cancellation hooks
-- retry policy
-- telemetry
-- run traces
-- Python event stream
+The current focus is proving the scheduler core: graph validation, dependency scheduling, concurrent node execution, output passing, failure handling, telemetry, and Python bindings.
 
-## Want to measure: 
- Measured coordination overhead of a Rust scheduler vs equivalent Python asyncio scheduler across sequential chains, parallel fan-out, and fan-in workflows.
-
-## Final python API shape
-
+See [report.md](./report.md) for the benchmark setup, current results, limitations, and roadmap.
